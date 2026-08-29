@@ -103,6 +103,12 @@ Rules for extraction, and the reasoning behind each:
 - **Subjects are stable slugs**, e.g. `rosen_2019`, `acme_corp`. Reuse existing
   subject strings — check with `facto.py context <name>` if unsure. Inconsistent
   subject naming breaks joins just as badly as inconsistent predicate naming.
+- **Normalize object values the same way you normalize subjects.** A path
+  without a trailing slash, a number without units or thousands separators, a
+  date in ISO form. A functional predicate compares strings, so it cannot tell
+  cosmetic drift from real disagreement: `.facto` and `.facto/` extracted from
+  two files raise a conflict that costs a review and resolves to nothing. Decide
+  the form once per predicate and hold to it.
 - **Attribute to the source you actually read.** If a review reports another
   study's number, the source is the review, not the original paper. This is
   precisely the case where research notes go wrong, and it is the case the
