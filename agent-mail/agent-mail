@@ -1,0 +1,505 @@
+#!/usr/bin/env python3
+"""agent-mail - Maildir-style 1:1 message passing between local LLM agents.
+
+Layout, one maildir per agent, laid out the way Postfix/qmail do it:
+
+    $AGENT_MAIL_ROOT/<agent>/tmp/   message mid-write, invisible to readers
+    $AGENT_MAIL_ROOT/<agent>/new/   delivered, unread
+    $AGENT_MAIL_ROOT/<agent>/cur/   read (renamed with Maildir's :2,S flag)
+
+Delivery writes into tmp/ and then renames into new/, which is atomic on the
+same filesystem. A reader therefore never sees half a message, and concurrent
+senders never collide because the filename carries time, pid and a random
+token. No locking is needed anywhere - that is the whole point of Maildir.
+
+Addresses are <name>@<domain> and both halves are required, so several
+independent groups can each run their own 'devops'. The domain is simply part
+of the mailbox directory name rather than a second directory level, which
+keeps delivery a single rename.
+
+Writing a recipient bare is shorthand for the *sender's own* domain, so the
+members of one group address each other by bare name and only cross-group mail
+spells out the full address. That is a fixed rule, not a search: a bare name is
+never resolved by looking around for the only matching mailbox, because that
+would start misdelivering the day a second group registered the same name.
+
+Mailboxes that predate domains keep working and are matched exactly, but no
+new one can be registered without a domain.
+"""
+
+import argparse
+import atexit
+import os
+import random
+import re
+import socket
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path(os.environ.get("AGENT_MAIL_ROOT") or Path.home() / ".claude" / "mail")
+AGENTS_DIR = ROOT / ".agents"  # <name> -> metadata (cwd, created)
+WATCH_DIR = ROOT / ".watch"    # <name> -> pid of the live watcher, if any
+DEFAULT_DOMAIN = os.environ.get("AGENT_MAIL_DOMAIN", "")  # group for bare names
+
+ATOM_RE = re.compile(r"[A-Za-z0-9._-]+")
+UNSAFE_RE = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def die(msg):
+    print(f"agent-mail: {msg}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+# ------------------------------------------------------------------ addresses
+
+def split_addr(addr):
+    """('devops@alpha') -> ('devops', 'alpha'); ('devops') -> ('devops', '')."""
+    local, sep, domain = addr.partition("@")
+    return local, (domain if sep else "")
+
+
+def valid_atom(s):
+    # A leading dot would collide with .agents/.watch, so it is not a name.
+    return bool(s) and not s.startswith(".") and ATOM_RE.fullmatch(s) is not None
+
+
+def valid_addr(addr):
+    """<local>@<domain>, each half an atom. Both halves are required: an agent
+    with no domain belongs to no group, and a bare name is exactly the thing
+    that becomes ambiguous once a second group exists."""
+    local, sep, domain = addr.partition("@")
+    return bool(sep) and valid_atom(local) and valid_atom(domain)
+
+
+def domain_of(addr):
+    return split_addr(addr)[1]
+
+
+def qualify(addr, domain):
+    """Put a bare name into `domain`. An address that already carries a domain
+    is left alone - that is how you reach another group."""
+    if "@" in addr or not domain:
+        return addr
+    return f"{addr}@{domain}"
+
+
+def is_box(name):
+    return (ROOT / name / "new").is_dir()
+
+
+def candidates(local):
+    """Every existing mailbox named <local>@<something>."""
+    return sorted(b.name for b in ROOT.glob(f"{local}@*") if (b / "new").is_dir())
+
+
+def require_box(name):
+    """Mailboxes are matched exactly, never guessed. Resolving a bare name to
+    'the only <name>@<domain> around' would quietly start misdelivering the day
+    a second group registered the same name, so a bare name is an error that
+    names the real addresses instead."""
+    if is_box(name):
+        return
+    local, domain = split_addr(name)
+    if not domain:
+        found = candidates(local)
+        if found:
+            die(f"'{local}' has no domain - address it as "
+                f"{' or '.join(found)}")
+        die(f"no such agent: {name} (addresses are <name>@<domain>; "
+            f"run: agent-mail agents)")
+    die(f"no such agent: {name} (run: agent-mail agents)")
+
+
+# ------------------------------------------------------------------- identity
+
+# Identity is explicit and is never inferred from the surroundings. An earlier
+# version derived it from the tmux session, on the assumption that one session
+# held one agent; the day five agents shared a session they all silently
+# resolved to a single address. A guessed identity is not a cosmetic fault:
+# `read` moves someone else's mail into its own cur/, and `send` signs the
+# message with the wrong author. Both are silent and neither can be undone,
+# so refusing to guess is the only safe default.
+
+def field(name, key):
+    try:
+        text = (AGENTS_DIR / name).read_text()
+    except OSError:
+        return ""
+    for line in text.splitlines():
+        k, sep, value = line.partition("=")
+        if sep and k == key:
+            return value
+    return ""
+
+
+def whoami():
+    """The acting agent from $AGENT_MAIL_NAME, or '' when it is unset."""
+    pinned = os.environ.get("AGENT_MAIL_NAME", "")
+    return qualify(pinned, DEFAULT_DOMAIN) if pinned else ""
+
+
+def require_identity(as_name):
+    """Who this command acts as, and where that came from. --as beats the
+    environment; with neither, refuse rather than act as somebody."""
+    if as_name:
+        return as_name, "--as"   # exact; require_box reports an unknown box
+    me = whoami()
+    if me:
+        return me, "$AGENT_MAIL_NAME"
+    die("no identity: pass --as <name>@<domain>, or export "
+        "AGENT_MAIL_NAME=<name>@<domain> for this shell. agent-mail will not "
+        "guess which agent you are - guessing reads and consumes another "
+        "agent's mail")
+
+
+def count_new(name):
+    try:
+        return sum(1 for f in (ROOT / name / "new").iterdir() if f.is_file())
+    except OSError:
+        return 0
+
+
+def unread(name):
+    try:
+        return sorted((f for f in (ROOT / name / "new").iterdir() if f.is_file()),
+                      key=lambda f: f.name)
+    except OSError:
+        return []
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True          # someone else's process, but alive
+    except OSError:
+        return False
+    return True
+
+
+def watcher_pid(name):
+    """Pid of the live `watch` for `name`, or 0. A stale file reads as 0."""
+    try:
+        pid = int((WATCH_DIR / name).read_text().strip())
+    except (OSError, ValueError):
+        return 0
+    return pid if _pid_alive(pid) else 0
+
+
+def claim_watch(name):
+    """Refuse to start a second watcher for one address. Two of them announce
+    every message twice over, and from the outside the duplicate is invisible -
+    it looks like the mail arrived twice."""
+    WATCH_DIR.mkdir(parents=True, exist_ok=True)
+    pidfile = WATCH_DIR / name
+    for _ in range(2):
+        try:
+            fd = os.open(pidfile, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            running = watcher_pid(name)
+            if running:
+                die(f"a watcher for {name} is already running (pid {running}); "
+                    f"stop it first, or every message is announced twice")
+            pidfile.unlink(missing_ok=True)   # stale, the process is gone
+            continue
+        with os.fdopen(fd, "w") as fh:
+            fh.write(f"{os.getpid()}\n")
+        atexit.register(lambda: pidfile.unlink(missing_ok=True))
+        return
+    die(f"cannot claim the watcher slot for {name}")
+
+
+def headers(path):
+    """The message's headers, stopping at the blank line before the body."""
+    out = {}
+    try:
+        with path.open() as fh:
+            for line in fh:
+                line = line.rstrip("\n")
+                if not line:
+                    break
+                k, sep, value = line.partition(": ")
+                if sep:
+                    out[k] = value
+    except OSError:
+        pass
+    return out
+
+
+# ----------------------------------------------------------------- subcommands
+
+def cmd_register(args):
+    name = args.name
+    if "@" in name and args.domain:
+        if domain_of(name) != args.domain:
+            die(f"'{name}' already names a domain; --domain {args.domain} conflicts")
+    else:
+        name = qualify(name, args.domain or DEFAULT_DOMAIN)
+    if "@" not in name:
+        die(f"'{name}' needs a domain: every agent belongs to a group, so that "
+            f"several groups can each run their own '{name}'. Use "
+            f"'{name}@<domain>', --domain <domain>, or set $AGENT_MAIL_DOMAIN")
+    if not valid_addr(name):
+        die(f"invalid address '{name}' (letters, digits, . _ - "
+            f"and exactly one @domain)")
+
+    for sub in ("tmp", "new", "cur"):
+        (ROOT / name / sub).mkdir(parents=True, exist_ok=True)
+    AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    existing = field(name, "created")
+    created = existing or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    (AGENTS_DIR / name).write_text(f"cwd={os.getcwd()}\ncreated={created}\n")
+
+    if existing:
+        print(f"re-registered '{name}' (mailbox kept, {count_new(name)} unread)")
+    else:
+        print(f"registered '{name}' -> {ROOT / name}")
+    # Registering creates the mailbox; it does not make this shell that agent.
+    # Nothing about the surroundings is recorded as a claim on the address.
+    print(f"identify yourself with:  export AGENT_MAIL_NAME={name}\n"
+          f"                    or:  --as {name} on every command")
+
+
+def cmd_whoami(args):
+    me = whoami()
+    if not me:
+        die("no identity: export AGENT_MAIL_NAME=<name>@<domain>. Nothing "
+            "about this shell implies an address")
+    note = "" if is_box(me) else "   [no mailbox - run: agent-mail register]"
+    print(f"{me} (from $AGENT_MAIL_NAME){note}")
+
+
+def cmd_agents(args):
+    if not ROOT.is_dir():
+        die(f"no mail root at {ROOT}")
+    rows = []
+    for box in ROOT.iterdir():
+        if not (box / "new").is_dir():
+            continue
+        local, domain = split_addr(box.name)
+        if args.domain is not None and domain != args.domain:
+            continue
+        rows.append((domain, local, count_new(box.name), watcher_pid(box.name),
+                     bool(field(box.name, "created"))))
+    if not rows:
+        print("no mailboxes" + (f" in domain '{args.domain}'" if args.domain else ""))
+        return
+    last = None
+    for domain, local, n, pid, registered in sorted(rows):
+        if domain != last:
+            if last is not None:
+                print()
+            print(domain or "(no domain - registered before domains existed)")
+            last = domain
+        line = f"  {local:<22} {n:>2} unread"
+        line += f"   watcher pid {pid}" if pid else "   no watcher"
+        if not registered:
+            line += "   [mailbox with no registration]"
+        print(line)
+
+
+def cmd_send(args):
+    body = args.message
+    if body is None:
+        if sys.stdin.isatty():
+            die("no body: pass -m <text> or pipe it on stdin")
+        body = sys.stdin.read().rstrip("\n")
+
+    sender, _ = require_identity(getattr(args, "as_name", None))
+    # A bare recipient means "in my own group", so one group's members never
+    # have to know their domain and cannot accidentally reach another group's.
+    to = qualify(args.to, domain_of(sender))
+    require_box(to)
+
+    host = UNSAFE_RE.sub("_", socket.gethostname().split(".")[0]) or "localhost"
+    while True:  # Maildir uniqueness: time + pid + random, retried on collision
+        uniq = f"{int(time.time())}.P{os.getpid()}_{random.randint(0, 32767)}.{host}"
+        tmpf, newf = ROOT / to / "tmp" / uniq, ROOT / to / "new" / uniq
+        if not tmpf.exists() and not newf.exists():
+            break
+
+    date = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    try:
+        tmpf.write_text(f"From: {sender}\nTo: {to}\nDate: {date}\n"
+                        f"Subject: {args.subject}\n\n{body}\n")
+        os.replace(tmpf, newf)  # atomic: the reader never sees a partial message
+    except OSError as e:
+        tmpf.unlink(missing_ok=True)
+        die(f"cannot deliver to {to}: {e}")
+    print(f"sent to {to}: {args.subject}")
+
+
+def cmd_check(args):
+    me, _ = require_identity(args.as_name)
+    require_box(me)
+    waiting = unread(me)
+    if not waiting:
+        # Say nothing on an empty mailbox: any output at all is noise to a
+        # watcher. -v is there for a human wanting confirmation.
+        if args.verbose:
+            print(f"no new mail for {me}")
+        return
+    print(f"{len(waiting)} new message(s) for {me}:")
+    for f in waiting:
+        h = headers(f)
+        print(f"  from {h.get('From', 'unknown'):<16} {h.get('Subject', '(no subject)')}")
+    print("read them with: agent-mail read")
+
+
+def print_msg(path):
+    print(f"--------8<-------- {path.name}")
+    sys.stdout.write(path.read_text())
+    print("-------->8--------")
+
+
+def cmd_read(args):
+    me, _ = require_identity(args.as_name)
+    require_box(me)
+    n = 0
+    for f in unread(me):
+        print_msg(f)
+        # Maildir marks a read message by moving it to cur/ with the Seen flag.
+        try:
+            os.replace(f, ROOT / me / "cur" / f"{f.name}:2,S")
+        except OSError as e:
+            die(f"cannot mark {f.name} read: {e}")
+        n += 1
+    if n == 0:
+        if args.verbose:
+            print(f"no new mail for {me}")
+        return
+    print(f"({n} message(s) moved to cur/ as read)")
+
+
+def cmd_peek(args):
+    me, _ = require_identity(args.as_name)
+    require_box(me)
+    n = 0
+    for f in unread(me):
+        print_msg(f)
+        n += 1
+    if n == 0 and args.verbose:
+        print(f"no new mail for {me}")
+
+
+def cmd_watch(args):
+    """Print one line per newly delivered message and NOTHING otherwise, then
+    keep running. Meant to sit behind a Monitor: the agent is notified the
+    moment mail lands and spends no turns at all on empty checks, which is what
+    polling on a timer cannot avoid."""
+    if args.interval < 1:
+        die("--interval must be at least 1 second")
+    me, _ = require_identity(args.as_name)
+    require_box(me)
+    claim_watch(me)
+    seen = set()
+    while True:
+        present = set()
+        for f in unread(me):
+            present.add(f.name)
+            if f.name in seen:
+                continue  # already announced, still unread - not news
+            h = headers(f)
+            print(f"new mail from {h.get('From', 'unknown')}: "
+                  f"{h.get('Subject', '(no subject)')}", flush=True)
+        # Drop names whose message has left new/: read() only ever moves a
+        # message on to cur/, so a name that is gone cannot come back and be
+        # announced twice. The set stays the size of the unread mail rather
+        # than growing with every message ever delivered.
+        seen = present
+        time.sleep(args.interval)
+
+
+EPILOG = """\
+addresses are <name>@<domain>, both halves required, so each group can have
+its own 'devops'. A recipient written bare means "in my own domain"; spell out
+<name>@<domain> to reach another group. --as is always matched exactly.
+
+check/read/peek print NOTHING when there is no new mail, so a once-a-minute
+watcher stays silent. Pass -v to have them say "no new mail" instead.
+
+identity is explicit: every command acts as --as, or as $AGENT_MAIL_NAME, and
+refuses when given neither. It is not inferred from the terminal, the tmux
+session or the working directory - a wrong guess reads and consumes another
+agent's mail and signs outgoing mail with the wrong author, silently.
+
+environment:
+  AGENT_MAIL_ROOT     mail root (default ~/.claude/mail)
+  AGENT_MAIL_NAME     the address every command in this shell acts as
+  AGENT_MAIL_DOMAIN   default domain for bare names in this shell
+"""
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="agent-mail",
+        description="Maildir-style 1:1 mail between local agents.",
+        epilog=EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="command")
+
+    def add(name, help_text):
+        s = sub.add_parser(name, help=help_text, description=help_text)
+        return s
+
+    def add_as(s):
+        s.add_argument("--as", dest="as_name", metavar="NAME",
+                       help="act as NAME (identity is never inferred)")
+        return s
+
+    s = add("register", "create the mailbox for an address")
+    s.add_argument("name", help="<name>@<domain>, or <name> with --domain")
+    s.add_argument("-d", "--domain", default="",
+                   help="group this agent belongs to (required if not in <name>)")
+    s.set_defaults(func=cmd_register)
+
+    s = add("whoami", "show the address $AGENT_MAIL_NAME resolves to")
+    s.set_defaults(func=cmd_whoami)
+
+    s = add("agents", "list mailboxes, unread counts and live watchers, by domain")
+    s.add_argument("-d", "--domain", default=None, help="only this domain")
+    s.set_defaults(func=cmd_agents)
+
+    s = add_as(add("send", "deliver one message (body from stdin if no -m)"))
+    s.add_argument("to", help="recipient, bare name or <name>@<domain>")
+    s.add_argument("-s", "--subject", default="(no subject)")
+    s.add_argument("-m", "--message", default=None, help="body (else read stdin)")
+    s.set_defaults(func=cmd_send)
+
+    for name, help_text, func in (
+            ("check", "summarise unread mail, leaving it unread", cmd_check),
+            ("read", "print unread mail and mark it read", cmd_read),
+            ("peek", "print unread mail without marking it read", cmd_peek)):
+        s = add_as(add(name, help_text))
+        s.add_argument("-v", "--verbose", action="store_true",
+                       help='say "no new mail" instead of staying silent')
+        s.set_defaults(func=func)
+
+    s = add_as(add("watch", "run forever, printing one line per new message "
+                            "and nothing otherwise (put this behind a Monitor)"))
+    s.add_argument("--interval", type=int, default=5, metavar="SECS")
+    s.set_defaults(func=cmd_watch)
+
+    add("help", "show this help").set_defaults(func=None)
+    return p
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    if not args.command or args.command == "help":
+        parser.print_help()
+        return
+    try:
+        args.func(args)
+    except BrokenPipeError:
+        os._exit(0)  # `agent-mail read | head` is not an error
+    except KeyboardInterrupt:
+        raise SystemExit(130)
+
+
+if __name__ == "__main__":
+    main()
