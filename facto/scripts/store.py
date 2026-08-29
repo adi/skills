@@ -49,6 +49,7 @@ SCHEMA = [
         title: String,
         uri: String,
         path: String,
+        origin: String,
         sha: String,
         added_at: String,
     }
@@ -137,9 +138,12 @@ def connect(create=False):
     # dataframe=False keeps results as plain dicts and stops pycozo printing a
     # pandas-import traceback on installs without pandas.
     try:
-        return Client("sqlite", path, dataframe=False)
+        db = Client("sqlite", path, dataframe=False)
     except TypeError:
-        return Client("sqlite", path)
+        db = Client("sqlite", path)
+    if not create:
+        migrate(db)
+    return db
 
 
 def rows(result):
@@ -152,6 +156,42 @@ def rows(result):
 
 def query(db, script, params=None):
     return rows(db.run(script, params or {}))
+
+
+SOURCE_FIELDS = "id, title, uri, path, origin, sha, added_at"
+
+
+def migrate(db):
+    """Add `origin` to stores created before recheck existed.
+
+    Cozo relations have a fixed column set, so this rebuilds `source` rather
+    than altering it. Pre-existing rows get an empty origin, which recheck
+    reports as unverifiable instead of silently passing.
+    """
+    try:
+        db.run("?[origin] := *source{origin}")
+        return
+    except Exception:
+        pass
+    db.run("""
+        :create source_v2 {
+            id: String
+            =>
+            title: String,
+            uri: String,
+            path: String,
+            origin: String,
+            sha: String,
+            added_at: String,
+        }
+    """)
+    db.run(
+        "?[id, title, uri, path, origin, sha, added_at] := "
+        "*source{id, title, uri, path, sha, added_at}, origin = '' \n"
+        ":put source_v2"
+    )
+    db.run("::remove source")
+    db.run("::rename source_v2 -> source")
 
 
 def init(db):

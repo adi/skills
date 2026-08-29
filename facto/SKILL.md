@@ -174,6 +174,36 @@ your answer. If the ledger has nothing on a subject, say so and offer to ingest
 a source, rather than filling the gap from memory — filling gaps from memory is
 the exact failure this whole apparatus exists to prevent.
 
+## Sources that change underneath you
+
+`add-source` copies the file into `.facto/sources/`, so the ledger stays
+internally consistent no matter what happens to the original. That is the point,
+and it is also the risk: when the original moves on, the facts do not, and
+nothing says so. Code drifts fastest, but a spec, a pricing page or a wiki entry
+will do it too.
+
+```bash
+uv run scripts/facto.py recheck
+```
+
+Every source is re-hashed against the file it was registered from. Unchanged
+sources are reported and dropped. For a changed one, each live fact drawn from
+it is re-verified against the *current* text, and the ones whose quote has
+vanished are listed by id — the fact survived the refactor, the sentence
+supporting it did not.
+
+Sources registered before this command existed have no origin path recorded and
+are reported as unverifiable rather than quietly passing. So are sources whose
+origin has since been deleted or moved.
+
+Resolve a stale fact the same way as any other revision: retract it with a
+reason, re-register the current file as a new source, and re-extract. Do not
+edit the stored snapshot to make the quote match again — that snapshot is what
+makes every older fact checkable, and rewriting it forges the record.
+
+Run `recheck` when you return to a project after time away, before relying on
+the ledger for a decision, and after anything that rewrites sources in bulk.
+
 ## Writing your own rules
 
 The three built-in rules are a starting point. Most of the value in a mature

@@ -42,9 +42,10 @@ def cmd_add_source(args):
     dest = os.path.join(store.sources_dir(), f"{sid}.txt")
     os.makedirs(store.sources_dir(), exist_ok=True)
     shutil.copyfile(args.path, dest)
+    origin = os.path.abspath(args.path)
     db.run(
-        "?[id, title, uri, path, sha, added_at] <- $rows :put source",
-        {"rows": [[sid, args.title, args.uri or "", dest, sha, now()]]},
+        "?[id, title, uri, path, origin, sha, added_at] <- $rows :put source",
+        {"rows": [[sid, args.title, args.uri or "", dest, origin, sha, now()]]},
     )
     out(f"source_id {sid}")
     out(f"  title  {args.title}")
@@ -181,6 +182,72 @@ def cmd_load(args):
             out(f"  [{i}] {pred}({subject}, ...) — {reason}")
         out("\nRe-extract rejected facts from the source. Do not edit the JSON to")
         out("make it pass; a hand-patched quote is not a provenance record.")
+
+
+def cmd_recheck(args):
+    """Compare each registered source against the file it came from.
+
+    The store keeps its own copy, so a ledger stays internally consistent
+    forever — which is the problem. When the original moves on, the facts do
+    not, and nothing says so. This is the command that says so.
+    """
+    db = connect()
+    srcs = query(
+        db,
+        "?[id, title, origin, sha] := *source{id, title, origin, sha}",
+    )
+    unchanged, changed, unverifiable = [], [], []
+
+    for sid, title, origin, sha in sorted(srcs, key=lambda r: r[1]):
+        if not origin:
+            unverifiable.append((title, "no origin recorded (registered before recheck existed)"))
+            continue
+        if not os.path.exists(origin):
+            unverifiable.append((title, f"origin is gone: {origin}"))
+            continue
+        try:
+            current = open(origin, encoding="utf-8", errors="replace").read()
+        except OSError as e:
+            unverifiable.append((title, f"unreadable: {e}"))
+            continue
+        if digest(current) == sha:
+            unchanged.append(title)
+            continue
+
+        live = query(
+            db,
+            "?[id, pred, subject, object, quote] := "
+            "*fact{id, pred, subject, object, quote, source_id: $s, retracted_at: ''}",
+            {"s": sid},
+        )
+        norm = normalize(current)
+        stale = [f for f in live if normalize(f[4]) not in norm]
+        changed.append((title, origin, len(live) - len(stale), stale))
+
+    out(f"== unchanged ({len(unchanged)}) ==")
+    for title in unchanged:
+        out(f"  {title}")
+
+    out(f"\n== changed ({len(changed)}) ==")
+    for title, origin, still_ok, stale in changed:
+        out(f"\n{title}\n  {origin}")
+        out(f"  {still_ok} live fact(s) still supported by the current file")
+        if not stale:
+            continue
+        out(f"  {len(stale)} live fact(s) whose quote is GONE:")
+        for fid, pred, subject, obj, quote in stale:
+            out(f"    {fid}  {pred}({subject}, {obj})")
+            out(f'      "{quote}"')
+
+    out(f"\n== unverifiable ({len(unverifiable)}) ==")
+    for title, reason in unverifiable:
+        out(f"  {title} — {reason}")
+
+    total_stale = sum(len(c[3]) for c in changed)
+    if total_stale:
+        out(f"\n{total_stale} fact(s) rest on text that no longer exists. Retract each")
+        out("with a reason, then re-extract from the current file and re-register it")
+        out("as a new source. Do not edit the stored snapshot to make them pass.")
 
 
 def cmd_check(args):
@@ -338,6 +405,10 @@ def main(argv):
     sub.add_parser("check", help="run conflicts, gaps and single_source").set_defaults(
         fn=cmd_check
     )
+
+    sub.add_parser(
+        "recheck", help="re-verify every source against the file it came from"
+    ).set_defaults(fn=cmd_recheck)
 
     s = sub.add_parser("retract", help="retract a fact with a reason")
     s.add_argument("id")
