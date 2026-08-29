@@ -1,0 +1,157 @@
+"""CozoDB-backed fact store for the facto skill.
+
+Everything that touches the database lives here; facto.py is the CLI over it.
+Facts are append-only: retraction stamps a timestamp and reason, so the record
+of what was believed when survives every revision.
+"""
+
+import os
+import hashlib
+from datetime import datetime, timezone
+
+
+def store_dir():
+    return os.path.abspath(os.environ.get("FACTO_DIR", ".facto"))
+
+
+def sources_dir():
+    return os.path.join(store_dir(), "sources")
+
+
+def db_path():
+    return os.path.join(store_dir(), "store.db")
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def digest(*parts):
+    h = hashlib.sha256()
+    for p in parts:
+        h.update(str(p).encode("utf-8"))
+        h.update(b"\x00")
+    return h.hexdigest()[:16]
+
+
+def normalize(text):
+    """Whitespace-insensitive form used for quote verification."""
+    return " ".join(text.split())
+
+
+# --- schema -----------------------------------------------------------------
+
+SCHEMA = [
+    """
+    :create source {
+        id: String
+        =>
+        title: String,
+        uri: String,
+        path: String,
+        sha: String,
+        added_at: String,
+    }
+    """,
+    """
+    :create predicate {
+        name: String
+        =>
+        description: String,
+        functional: Bool,
+        object_type: String,
+        declared_at: String,
+    }
+    """,
+    """
+    :create proposal {
+        name: String
+        =>
+        rationale: String,
+        quote: String,
+        source_id: String,
+        proposed_at: String,
+    }
+    """,
+    """
+    :create fact {
+        id: String
+        =>
+        pred: String,
+        subject: String,
+        object: String,
+        source_id: String,
+        quote: String,
+        asserted_at: String,
+        retracted_at: String,
+        retract_reason: String,
+    }
+    """,
+]
+
+# --- rules ------------------------------------------------------------------
+# Add new rules here and wire them into `check` in facto.py so they run as part
+# of the routine pass rather than only when someone remembers to ask.
+
+CONFLICTS = """
+?[pred, subject, o1, id1, q1, s1, o2, id2, q2, s2] :=
+    *predicate{name: pred, functional: true},
+    *fact{id: id1, pred, subject, object: o1, quote: q1, source_id: s1, retracted_at: ''},
+    *fact{id: id2, pred, subject, object: o2, quote: q2, source_id: s2, retracted_at: ''},
+    o1 < o2
+"""
+
+GAPS = """
+described[s] := *fact{subject: s, retracted_at: ''}
+?[entity, pred, subject] :=
+    *predicate{name: pred, object_type: 'entity'},
+    *fact{pred, subject, object: entity, retracted_at: ''},
+    not described[entity]
+"""
+
+SINGLE_SOURCE = """
+srcs[subject, pred, source_id] := *fact{pred, subject, source_id, retracted_at: ''}
+counted[subject, pred, count(source_id)] := srcs[subject, pred, source_id]
+?[subject, pred, n] := counted[subject, pred, n], n == 1
+"""
+
+
+# --- connection -------------------------------------------------------------
+
+def connect(create=False):
+    try:
+        from pycozo.client import Client
+    except ImportError:
+        raise SystemExit(
+            'pycozo is not installed. Run: pip install "pycozo[embedded]"'
+        )
+    path = db_path()
+    if not create and not os.path.exists(path):
+        raise SystemExit(
+            f"no store at {path} — run `python scripts/facto.py init` first"
+        )
+    os.makedirs(store_dir(), exist_ok=True)
+    # dataframe=False keeps results as plain dicts and stops pycozo printing a
+    # pandas-import traceback on installs without pandas.
+    try:
+        return Client("sqlite", path, dataframe=False)
+    except TypeError:
+        return Client("sqlite", path)
+
+
+def rows(result):
+    """pycozo returns a dict or a DataFrame depending on whether pandas is
+    installed. Normalize to a list of lists."""
+    if isinstance(result, dict):
+        return result.get("rows", [])
+    return result.values.tolist()
+
+
+def query(db, script, params=None):
+    return rows(db.run(script, params or {}))
+
+
+def init(db):
+    for stmt in SCHEMA:
+        db.run(stmt)
+    os.makedirs(sources_dir(), exist_ok=True)

@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+
+# Local fact stores created by the facto skill when it is run in place.
+.facto/
