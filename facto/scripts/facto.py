@@ -1,8 +1,15 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.9"
+# dependencies = ["pycozo[embedded]"]
+# ///
 """facto — a quote-backed fact ledger over CozoDB.
 
-Usage: python scripts/facto.py <command> [args]
+Usage: uv run scripts/facto.py <command> [args]
 Run with no arguments for the command list.
+
+The dependency is declared above (PEP 723) rather than in prose, so uv builds
+and caches the environment on first run and there is no install step to forget.
 """
 
 import argparse

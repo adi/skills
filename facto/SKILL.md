@@ -17,20 +17,20 @@ it enters the record.
 
 ## Setup
 
-Requires `pycozo[embedded]`. Install on first use:
+**Requires [uv](https://docs.astral.sh/uv/).** There is no install step: the
+CozoDB dependency is declared in a PEP 723 block at the top of `scripts/facto.py`,
+so `uv run` builds and caches the environment on first use and every later run
+starts from cache. Never invoke the scripts with a bare `python` — a stale
+interpreter environment is exactly the drift this skill exists to prevent, and
+the scripts will refuse rather than half-work.
 
-```bash
-pip install "pycozo[embedded]"
-```
-
-Scripts live in `scripts/`. Run them from the research directory; the store
-lands in `.facto/` (override with the `FACTO_DIR` environment variable).
-Add `.facto/store.db` to version control if the team shares findings — it is
+Run them from the research directory; the store lands in `.facto/` (override
+with the `FACTO_DIR` environment variable). Add `.facto/store.db` to version control if the team shares findings — it is
 a single file — but keep `.facto/sources/` out of git if the sources are large
 or licensed.
 
 ```bash
-python scripts/facto.py init
+uv run scripts/facto.py init
 ```
 
 ## The loop
@@ -42,7 +42,7 @@ the notes it replaced.
 ### 1. Register the source
 
 ```bash
-python scripts/facto.py add-source paper.txt --title "Rosen et al. 2019" --uri "https://doi.org/..."
+uv run scripts/facto.py add-source paper.txt --title "Rosen et al. 2019" --uri "https://doi.org/..."
 ```
 
 Prints a `source_id`. The file is hashed and copied into `.facto/sources/`, so
@@ -54,7 +54,7 @@ file is what gets registered.
 ### 2. Read the registry before extracting
 
 ```bash
-python scripts/facto.py predicates
+uv run scripts/facto.py predicates
 ```
 
 This is the step that keeps the schema from rotting. Left to itself, extraction
@@ -65,10 +65,10 @@ current registry into context before extracting, and match against it.
 Declare predicates deliberately, few and general rather than many and specific:
 
 ```bash
-python scripts/facto.py declare sample_size \
+uv run scripts/facto.py declare sample_size \
   --desc "Number of enrolled participants in a study" --functional
 
-python scripts/facto.py declare contradicted_by \
+uv run scripts/facto.py declare contradicted_by \
   --desc "A study whose result fails to replicate this one" --object-type entity
 ```
 
@@ -112,7 +112,7 @@ Rules for extraction, and the reasoning behind each:
   and move on:
 
 ```bash
-python scripts/facto.py propose funding_source \
+uv run scripts/facto.py propose funding_source \
   --rationale "Funding matters for bias assessment across the whole corpus" \
   --quote "Supported by a grant from the Wellcome Trust" --source 164393cc
 ```
@@ -120,7 +120,7 @@ python scripts/facto.py propose funding_source \
 Then load:
 
 ```bash
-python scripts/facto.py load facts.json
+uv run scripts/facto.py load facts.json
 ```
 
 The output lists every rejection with a reason. Re-extract rejected facts rather
@@ -130,7 +130,7 @@ record that no longer means anything.
 ### 4. Check, and resolve what it finds
 
 ```bash
-python scripts/facto.py check
+uv run scripts/facto.py check
 ```
 
 Three rules run:
@@ -143,7 +143,7 @@ Three rules run:
   claims most worth corroborating before you build on them.
 
 ```bash
-python scripts/facto.py retract 832771d6ca8bd166 \
+uv run scripts/facto.py retract 832771d6ca8bd166 \
   --reason "Okonkwo misquotes Rosen; primary source says 412"
 ```
 
@@ -159,8 +159,8 @@ When the user asks a research question, pull facts from the ledger rather than
 reasoning from your own recollection of earlier sessions:
 
 ```bash
-python scripts/facto.py context rosen_2019
-python scripts/facto.py show 408fbd0f888282e0
+uv run scripts/facto.py context rosen_2019
+uv run scripts/facto.py show 408fbd0f888282e0
 ```
 
 Everything returned is live and quote-backed. Cite the quote and source title in
@@ -176,7 +176,7 @@ entity resolution, coverage matrices over a research question. Read
 `references/cozoscript.md` for the syntax and worked examples, then:
 
 ```bash
-python scripts/facto.py query "?[subject, object] := *fact{pred: 'studies', subject, object, retracted_at: ''}"
+uv run scripts/facto.py query "?[subject, object] := *fact{pred: 'studies', subject, object, retracted_at: ''}"
 ```
 
 When a rule proves useful, add it to `scripts/store.py` next to `CONFLICTS` so

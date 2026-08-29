@@ -123,12 +123,15 @@ def connect(create=False):
         from pycozo.client import Client
     except ImportError:
         raise SystemExit(
-            'pycozo is not installed. Run: pip install "pycozo[embedded]"'
+            "pycozo is missing, which means this was not run through uv.\n"
+            "Use: uv run scripts/facto.py <command>   (or ./scripts/facto.py)\n"
+            "uv reads the dependency block at the top of facto.py and builds the\n"
+            "environment itself; install it from https://docs.astral.sh/uv/ if needed."
         )
     path = db_path()
     if not create and not os.path.exists(path):
         raise SystemExit(
-            f"no store at {path} — run `python scripts/facto.py init` first"
+            f"no store at {path} — run `uv run scripts/facto.py init` first"
         )
     os.makedirs(store_dir(), exist_ok=True)
     # dataframe=False keeps results as plain dicts and stops pycozo printing a
