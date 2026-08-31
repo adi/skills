@@ -1,6 +1,6 @@
 ---
 name: facto
-description: Record research findings as quote-backed facts in a Datalog (CozoDB) store that detects contradictions, tracks belief revision over time, and assembles prompt context from verified facts instead of vector-similarity chunks. Use this skill whenever the user is doing research that spans multiple sessions or sources — literature reviews, competitive analysis, due diligence, investigations, long-running notes — or whenever they mention fact extraction, provenance, citations, knowledge graphs, contradiction detection, or "things I've learned so far." Also use it when the user complains that their notes have drifted, that they can't remember where a claim came from, or that an AI assistant keeps losing or inventing details across a long project. Prefer this over freeform markdown notes or a RAG index any time the accuracy of individual claims matters more than the fluency of the summary.
+description: Record findings as facts in a Datalog (CozoDB) store where each one cites either a verbatim quote or a command that can be re-run, so a claim is re-checkable rather than merely sourced. Detects contradictions between agents, records who asserted what and when they stopped believing it, flags facts nobody has re-verified lately, and assembles prompt context from verified facts instead of vector-similarity chunks. Use this skill whenever work spans multiple sessions, sources or agents — literature reviews, competitive analysis, due diligence, investigations, infrastructure state, long-running notes — or whenever they mention fact extraction, provenance, citations, knowledge graphs, contradiction detection, stale notes, or "things I've learned so far." Reach for it especially when the claims are counts, versions or states of a running system: indexes, replicas, commits, rows, transitions. Also use it when the user complains that their notes have drifted, that they cannot remember where a claim came from, that two agents disagree, or that an AI assistant keeps losing or inventing details across a long project. Prefer this over freeform markdown notes or a RAG index any time the accuracy of individual claims matters more than the fluency of the summary.
 ---
 
 # Facto
@@ -11,9 +11,15 @@ This skill fixes the division of labour. The model does extraction — turning
 prose into structured claims, which it is very good at. A Datalog store does
 memory and inference — which it does without hallucinating.
 
-The load path refuses any fact whose supporting quote is not literally present
-in the source. That single mechanical gate catches most extraction drift before
-it enters the record.
+The load path refuses any fact whose evidence does not hold up. A quoted fact is
+refused unless the quote is literally present in the source; a command-backed
+fact is refused unless the command runs and produces the output recorded with it.
+That single mechanical gate catches most extraction drift before it enters the
+record, and the command half is what extends it to the claims a sentence cannot
+settle — counts, versions, the state of something running.
+
+Every fact also records who asserted it, so a disagreement between two agents is
+answerable rather than just visible.
 
 ## Setup
 
@@ -81,7 +87,10 @@ right rather than a literal value. This powers gap detection.
 
 ### 3. Extract
 
-Read the source and emit JSON. One object per claim:
+Read the source and emit JSON. One object per claim, and every claim carries
+**exactly one** of two kinds of evidence.
+
+**A quote**, for anything a sentence can settle:
 
 ```json
 {"facts": [
@@ -90,6 +99,37 @@ Read the source and emit JSON. One object per claim:
    "quote": "The study enrolled 412 participants across three sites."}
 ]}
 ```
+
+**A command**, for anything it cannot — which is most counts:
+
+```json
+{"facts": [
+  {"pred": "index_count", "subject": "prod_db", "object": "155",
+   "command": "grep -c '^CREATE .*INDEX' indexes.sql",
+   "cwd": "~/work/db", "source_id": "164393cc1a278695"},
+
+  {"pred": "replica_count", "subject": "api_deploy", "object": "3",
+   "command": "kubectl get deploy api -o jsonpath='{.status.readyReplicas}'"}
+]}
+```
+
+The command is run at load time and its output is stored as the fact's evidence;
+`recheck` runs it again and compares. **Use a command whenever the claim is a
+count, a version, a length or a state** — indexes, replicas, commits, rows,
+transitions. A quote cannot distinguish 154 from 155 when a line mentions both,
+and a sentence about a change ("we went from 154 to 155 this week") will pass the
+quote gate as evidence for either number. `grep -c` cannot. This is the single
+biggest thing you can do to make a claim self-checking rather than merely
+sourced.
+
+A command needs no `source_id` at all, which is what lets a fact describe a
+running system rather than a file. Give one anyway when the command reads a
+registered file, so the fact still joins to that source.
+
+Add `"expect": "155"` to declare the output you believe the command produces; the
+load refuses the fact if it produces something else. Use it when you are
+transcribing a number you already ran — it catches the transcription, not the
+system.
 
 Rules for extraction, and the reasoning behind each:
 
@@ -114,6 +154,14 @@ Rules for extraction, and the reasoning behind each:
   precisely the case where research notes go wrong, and it is the case the
   conflict rule is designed to surface.
 - **Never guess a `source_id`.** Use the one printed by `add-source`.
+- **A command must be reproducible and read-only.** It runs at load and on every
+  recheck, so anything with a side effect will have it repeatedly. Pin what you
+  can: a path rather than `$PWD`, an explicit `--context`, a tag rather than
+  `latest`. `cwd` is recorded with the command, defaulting to where you ran the
+  load, because `grep -c … indexes.sql` means nothing without it.
+- **A command's output is the evidence, not the claim.** The object is still your
+  reading of it. For a count they will normally be identical, and if they are not,
+  say why in the object or use a quote instead.
 - **When no registered predicate fits**, do not improvise one. File a proposal
   and move on:
 
@@ -123,11 +171,19 @@ uv run scripts/facto.py propose funding_source \
   --quote "Supported by a grant from the Wellcome Trust" --source 164393cc
 ```
 
-Then load:
+Then load, saying who you are:
 
 ```bash
-uv run scripts/facto.py load facts.json
+uv run scripts/facto.py load facts.json --as devops@ejobs
 ```
+
+Every fact records its author, and the load refuses without one — `--as`, or
+`$FACTO_AGENT`, or `$AGENT_MAIL_NAME`, which is the address you already claim on
+the mail network. Nothing is inferred from the shell or the host: a wrong author
+is worse than none, because it will be believed. When several agents write to one
+store, "who asserted this, and when did they stop believing it" is most of what
+you will want to ask, and a fact with no author cannot answer it. Retraction
+records its author too.
 
 The output lists every rejection with a reason. Re-extract rejected facts rather
 than editing the JSON to make it pass — a hand-patched quote is a provenance
@@ -139,18 +195,25 @@ record that no longer means anything.
 uv run scripts/facto.py check
 ```
 
-Three rules run:
+Four rules run:
 
-- **conflicts** — two live facts disagree on a functional predicate. Resolve by
-  retracting the wrong one with a reason. Never delete.
+- **conflicts** — two live facts disagree on a functional predicate, reported
+  with **who asserted each side** and what each cited. Where one side is a quote
+  and the other a command, you can usually settle it on the spot: run the
+  command. Resolve by retracting the wrong one with a reason. Never delete.
 - **gaps** — an entity referenced as an object but never described as a subject.
   Usually a cited work you have not read yet. This is your reading queue.
 - **single_source** — claims resting on exactly one source. Not errors, but the
   claims most worth corroborating before you build on them.
+- **stale** — facts nobody has verified in `--days` days (14 by default, or
+  `$FACTO_STALE_DAYS`). This is the one that arrives without being asked for, and
+  it is deliberately noisy about age rather than plausibility: the note that costs
+  you weeks is the one that was accurate when written and never re-read. `recheck`
+  is what clears it.
 
 ```bash
-uv run scripts/facto.py retract 832771d6ca8bd166 \
-  --reason "Okonkwo misquotes Rosen; primary source says 412"
+uv run scripts/facto.py retract 832771d6ca8bd166 --as mono@ejobs \
+  --reason "grep -c on the same file says 156; the quoted line describes a change, not the count"
 ```
 
 Retraction sets a timestamp and reason. The fact stays queryable forever, which
@@ -192,6 +255,24 @@ it is re-verified against the *current* text, and the ones whose quote has
 vanished are listed by id — the fact survived the refactor, the sentence
 supporting it did not.
 
+Then every command-backed fact is **run again** and its output compared with what
+was stored. This is the half that catches a moved number rather than a moved
+sentence:
+
+```
+MOVED  index_count(prod_db, 155)  [174fbf5ce4ea1233]  asserted by mono@ejobs
+  $ grep -c '^CREATE .*INDEX' indexes.sql
+  was '155', now '156'
+```
+
+A command that no longer runs at all is reported as UNRUNNABLE rather than as
+agreement — an absent answer is not a matching one.
+
+Whatever still holds gets a fresh `verified_at`, which is the only thing recheck
+writes and the only thing that clears the **stale** list. So the loop closes:
+`check` tells you what has not been looked at, `recheck` looks, and what survives
+stops nagging until it ages again.
+
 Sources registered before this command existed have no origin path recorded and
 are reported as unverifiable rather than quietly passing. So are sources whose
 origin has since been deleted or moved.
@@ -202,7 +283,13 @@ edit the stored snapshot to make the quote match again — that snapshot is what
 makes every older fact checkable, and rewriting it forges the record.
 
 Run `recheck` when you return to a project after time away, before relying on
-the ledger for a decision, and after anything that rewrites sources in bulk.
+the ledger for a decision, and after anything that rewrites sources in bulk — or
+just when `check` says something has gone unverified for a fortnight.
+
+Commands are run by `bash -o pipefail -c` with a 30 second limit
+(`$FACTO_COMMAND_TIMEOUT`). `FACTO_RUN_COMMANDS=0` refuses to run any, which also
+means command-backed facts cannot be loaded — the store will not hold evidence it
+never verified.
 
 ## Writing your own rules
 
