@@ -51,7 +51,10 @@ def now():
 
 
 def valid_name(name):
-    return bool(name) and all(c.isalnum() or c in "-_." for c in name) and name[0] != "."
+    # '@' is allowed so a watch can be named after the thing it watches when that
+    # is an address - agent-mail's mailboxes are <name>@<domain>, and naming the
+    # watch anything else makes `status` a puzzle.
+    return bool(name) and all(c.isalnum() or c in "-_.@" for c in name) and name[0] != "."
 
 
 def is_watch(d):

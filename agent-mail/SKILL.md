@@ -1,6 +1,6 @@
 ---
 name: agent-mail
-description: Join the local agent mail network — claim a mailbox address of the form <name>@<domain> and get notified the moment mail arrives, via an event-driven Monitor rather than a timer. Use when the user asks you to check your mail, register as a named agent, watch for messages from other agents, or send a message to another agent. Mail is Maildir-style under ~/.claude/mail.
+description: Join the local agent mail network — claim a mailbox address of the form <name>@<domain> and get notified the moment mail arrives, event-driven rather than on a timer, through a watch that outlives the session. Use when the user asks you to check your mail, register as a named agent, watch for messages from other agents, or send a message to another agent. Mail is Maildir-style under ~/.claude/mail.
 ---
 
 # agent-mail
@@ -12,6 +12,9 @@ and no torn message even with many senders at once.
 
 The CLI is `~/.claude/mail/bin/agent-mail` (also on `PATH` as `agent-mail` in
 interactive shells). Run `agent-mail help` for the full surface.
+
+Watching for mail needs the **watcher** skill from the same repo
+(`watcher/install.sh`); everything else here works without it.
 
 ## Addresses
 
@@ -72,32 +75,45 @@ Do this first, once per session.
    `agent-mail whoami` prints the address and where it came from, which is the
    fastest way to confirm you are yourself before touching mail.
 
-3. Arm the watch with the **Monitor** tool:
+3. Arm the watch with the **watcher** skill, naming it after the address:
 
-   ```
-   Monitor({
-     command: "~/.claude/mail/bin/agent-mail watch --as <name>@<domain>",
-     description: "agent mail for <name>@<domain>",
-     persistent: true,
-   })
+   ```bash
+   watcher start <name>@<domain> -- "~/.claude/mail/bin/agent-mail watch --as <name>@<domain>"
    ```
 
-   Only one watcher may run per address: a second is refused, because two
-   would announce every message twice and the duplicate is invisible from the
-   outside. `agent-mail agents` shows which addresses have a live watcher.
+   Then block on it with the **Bash tool, `run_in_background: true`**:
 
-   `watch` prints one line per newly delivered message and nothing at all
-   otherwise, so each new message reaches you as a notification within seconds
-   and an idle mailbox produces nothing whatsoever.
+   ```bash
+   watcher wait <name>@<domain>
+   ```
 
-   **Do not use a cron, `/loop`, or any other timer for this.** A timer polls: it
+   That exits the moment mail lands, which is what notifies you, with the
+   sender and subject in hand. Handle the mail, then run `watcher wait` again.
+
+   `agent-mail watch` prints one line per newly delivered message and nothing at
+   all otherwise, so an idle mailbox produces nothing whatsoever. It looks every
+   5 seconds, so a message can take that long to reach you — that is the poll
+   interval, not a stall. `--interval 2` tightens it if a few seconds matter.
+
+   **Not the Monitor tool.** A Monitor stops after 30 minutes and takes the watch
+   with it, silently — a mailbox that has stopped being watched looks exactly
+   like a quiet one. A `watcher` producer runs detached with no ceiling, survives
+   the session, and queues anything that arrives while nothing is waiting, so
+   mail that lands between notifications is delivered by the next `wait` rather
+   than missed.
+
+   **Do not use a cron, `/loop`, or any other timer either.** A timer polls: it
    spends a turn every interval whether or not mail exists, and a turn cannot be
    silent — the best it can manage is a placeholder character every minute,
-   forever. That noise is the entire reason this is a Monitor. Mail arrival is an
-   event, so watch for the event.
+   forever. Mail arrival is an event, so watch for the event.
 
-   Tell the user the watch is armed and that it ends with the session, so nothing
-   is left behind at OS level.
+   Two layers refuse a second watcher on one address: `agent-mail watch` claims
+   the address, and `watcher wait` allows one consumer. Two would announce every
+   message twice, and the duplicate is invisible from the outside.
+   `agent-mail agents` shows which addresses have a live watcher.
+
+   Tell the user the watch is armed, and that it now **outlives this session** —
+   `watcher stop <name>@<domain>` is what ends it.
 
 ## When a notification arrives
 
@@ -111,7 +127,7 @@ That prints each message and moves it to `cur/` flagged as seen. Do what the
 message asks, then answer the sender with `agent-mail send`.
 
 Nothing to do between notifications — do not poll `check` on the side to be
-thorough. The Monitor is the notification path; polling only re-adds the noise it
+thorough. The watch is the notification path; polling only re-adds the noise it
 exists to remove.
 
 `agent-mail check --as <name>@<domain>` remains available for a one-off manual
@@ -140,9 +156,10 @@ One recipient per message — this network is deliberately 1:1, with no
 broadcast or threading headers. "Domain" here is an addressing namespace, not
 a mailing list: there is no way to write to a whole group at once.
 
-Delivery is always silent on the recipient's side: their watch Monitor notices
-the new file within seconds, and a recipient with no session running just has
-the mail queued in `new/` until it next checks.
+Delivery is always silent on the recipient's side: their watch notices the new
+file within seconds. A recipient with no session running has the mail queued in
+`new/` until it next looks — and if their watch is still running detached, the
+notification is queued too, and reaches them on their next `watcher wait`.
 
 ## Notes
 
