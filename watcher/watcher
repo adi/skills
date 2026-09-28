@@ -1,0 +1,372 @@
+#!/usr/bin/env python3
+"""watcher - long-lived event watches for local LLM agents.
+
+A watch is a command whose stdout lines are events. The command runs detached,
+in its own session, writing every line it produces to an append-only spool:
+
+    $WATCHER_ROOT/<name>/command       what is being watched
+    $WATCHER_ROOT/<name>/events.jsonl  one JSON object per event, append-only
+    $WATCHER_ROOT/<name>/producer.pid  the detached process
+    $WATCHER_ROOT/<name>/cursor        how far the consumer has read
+    $WATCHER_ROOT/<name>/waiter.pid    the one consumer currently blocked
+
+The split between *producing* events and *waiting* for them is the whole design.
+A harness notifies an agent when a background process exits, not while it runs,
+so a watch that never exits can never notify. Here the producer runs forever and
+`wait` exits the moment there is something to report: put `wait` in the
+background, get woken with the events, handle them, arm `wait` again.
+
+Because the producer is detached and the spool is on disk, events that arrive
+while nothing is waiting are not lost - they queue, and the next `wait` returns
+them immediately. That also means a watch outlives the session that started it:
+a new session runs `status`, sees it still running, and picks up where the last
+one stopped reading.
+
+One consumer per watch, refused rather than shared: two waiters would each
+consume part of the stream and neither would see all of it, which is invisible
+from the outside.
+"""
+
+import argparse
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+ROOT = Path(os.environ.get("WATCHER_ROOT") or Path.home() / ".claude" / "watchers")
+POLL = float(os.environ.get("WATCHER_POLL", "0.25"))
+
+
+def die(msg, code=1):
+    print(f"watcher: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def valid_name(name):
+    return bool(name) and all(c.isalnum() or c in "-_." for c in name) and name[0] != "."
+
+
+def is_watch(d):
+    """A directory is a watch if it has a command. The CLI lives under the same
+    root when installed (bin/), and a stray directory should not read as a
+    watch that has somehow lost its command."""
+    return d.is_dir() and (d / "command").exists()
+
+
+def watch_names():
+    if not ROOT.is_dir():
+        return []
+    return sorted(p.name for p in ROOT.iterdir() if is_watch(p))
+
+
+def box(name):
+    if not valid_name(name):
+        die(f"invalid watch name: {name!r} (letters, digits, - _ . only)")
+    return ROOT / name
+
+
+def pid_alive(pid):
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def read_pid(path):
+    try:
+        return int(path.read_text().strip())
+    except (OSError, ValueError):
+        return 0
+
+
+def write_pid(path, pid):
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(f"{pid}\n")
+    tmp.replace(path)
+
+
+def producer_pid(name):
+    pid = read_pid(box(name) / "producer.pid")
+    return pid if pid_alive(pid) else 0
+
+
+def require_watch(name):
+    d = box(name)
+    if not is_watch(d):
+        known = ", ".join(watch_names())
+        die(f"no watch called {name!r}" + (f" (have: {known})" if known else ""))
+    return d
+
+
+def events_since(d, offset):
+    """Return (events, new_offset). Reading by byte offset rather than line
+    count means a consumer never re-reads or skips a line if the file grows
+    between the seek and the read."""
+    path = d / "events.jsonl"
+    if not path.exists():
+        return [], offset
+    with path.open("r", encoding="utf-8", errors="replace") as fh:
+        fh.seek(offset)
+        chunk = fh.read()
+        new_offset = fh.tell()
+    out = []
+    for line in chunk.splitlines():
+        if not line.strip():
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            out.append({"ts": "", "line": line})
+    return out, new_offset
+
+
+# --------------------------------------------------------------- producing --
+
+def cmd_produce(args):
+    """Internal: run the command and append each stdout line to the spool.
+
+    Not for humans - `start` spawns this detached. It exists as a subcommand so
+    the producer is a normal process with a pid file rather than a shell
+    pipeline nobody can account for later.
+    """
+    d = box(args.name)
+    command = (d / "command").read_text()
+    write_pid(d / "producer.pid", os.getpid())
+    log = (d / "events.jsonl").open("a", encoding="utf-8")
+
+    def emit(kind, line):
+        log.write(json.dumps({"ts": now(), "kind": kind, "line": line}) + "\n")
+        log.flush()
+        os.fsync(log.fileno())
+
+    emit("meta", f"watch started: {command.strip()}")
+    p = subprocess.Popen(
+        ["bash", "-o", "pipefail", "-c", command],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        text=True, bufsize=1, cwd=(d / "cwd").read_text().strip() or None,
+        start_new_session=True,
+    )
+    try:
+        for line in p.stdout:
+            emit("event", line.rstrip("\n"))
+    finally:
+        code = p.wait()
+        # A producer that stops is news in itself: a watch that has died looks
+        # exactly like a quiet one from the outside, which is the failure this
+        # line exists to prevent.
+        emit("meta", f"watch ended: command exited {code}")
+        (d / "exit").write_text(f"{code}\n")
+        log.close()
+
+
+# ------------------------------------------------------------------ verbs ---
+
+def cmd_start(args):
+    name = args.name
+    d = box(name)
+    if producer_pid(name):
+        die(f"{name} is already running (pid {producer_pid(name)}); `watcher stop {name}` first")
+    command = " ".join(args.command).strip()
+    if not command:
+        die("give a command to watch, after --")
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "command").write_text(command + "\n")
+    (d / "cwd").write_text(os.path.abspath(args.cwd or os.getcwd()) + "\n")
+    (d / "exit").unlink(missing_ok=True)
+
+    me = os.path.abspath(__file__)
+    child = subprocess.Popen(
+        [sys.executable, me, "_produce", name],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL, start_new_session=True,
+    )
+    # Wait briefly for the producer to claim its pid file, so `start` reports
+    # what actually happened rather than what was attempted.
+    for _ in range(40):
+        if producer_pid(name):
+            break
+        if child.poll() is not None:
+            die(f"producer exited immediately (code {child.returncode})")
+        time.sleep(0.05)
+    print(f"watching {name}: {command}")
+    print(f"  arm a notification with:  watcher wait {name}")
+
+
+def cmd_wait(args):
+    name = args.name
+    d = require_watch(name)
+
+    other = read_pid(d / "waiter.pid")
+    if pid_alive(other) and other != os.getpid():
+        die(f"{name} already has a waiter (pid {other}); one consumer per watch", 4)
+    write_pid(d / "waiter.pid", os.getpid())
+
+    cursor_path = d / "cursor"
+    offset = int(cursor_path.read_text().strip() or 0) if cursor_path.exists() else 0
+    deadline = time.time() + args.timeout if args.timeout else None
+
+    try:
+        while True:
+            events, new_offset = events_since(d, offset)
+            events = [e for e in events if args.meta or e.get("kind") != "meta"]
+            if events:
+                cursor_path.write_text(str(new_offset))
+                for e in events:
+                    stamp = (e.get("ts") or "")[11:19]
+                    print(f"{stamp}  {e['line']}", flush=True)
+                return
+            offset = new_offset
+            cursor_path.write_text(str(offset))
+
+            if not producer_pid(name):
+                code = (d / "exit").read_text().strip() if (d / "exit").exists() else "?"
+                print(f"watch {name} is not running (command exited {code})", flush=True)
+                raise SystemExit(3)
+            if deadline and time.time() >= deadline:
+                print(f"no events on {name} within {args.timeout}s", flush=True)
+                raise SystemExit(2)
+            time.sleep(POLL)
+    finally:
+        if read_pid(d / "waiter.pid") == os.getpid():
+            (d / "waiter.pid").unlink(missing_ok=True)
+
+
+def cmd_status(args):
+    names = watch_names()
+    if not names:
+        print("no watches")
+        return
+    if args.name:
+        names = [n for n in names if n == args.name] or die(f"no watch called {args.name!r}")
+    print(f"{'WATCH':<16} {'STATE':<10} {'PENDING':>7}  {'WAITER':<8} COMMAND")
+    for n in names:
+        d = ROOT / n
+        pid = producer_pid(n)
+        offset = int((d / "cursor").read_text().strip() or 0) if (d / "cursor").exists() else 0
+        pending, _ = events_since(d, offset)
+        pending = [e for e in pending if e.get("kind") != "meta"]
+        waiter = read_pid(d / "waiter.pid")
+        state = f"run {pid}" if pid else "stopped"
+        command = (d / "command").read_text().strip() if (d / "command").exists() else ""
+        print(f"{n:<16} {state:<10} {len(pending):>7}  "
+              f"{(str(waiter) if pid_alive(waiter) else '-'):<8} {command}")
+
+
+def cmd_log(args):
+    d = require_watch(args.name)
+    events, _ = events_since(d, 0)
+    for e in events[-args.tail:]:
+        stamp = (e.get("ts") or "")[11:19]
+        mark = "  " if e.get("kind") == "event" else "· "
+        print(f"{stamp}  {mark}{e['line']}")
+
+
+def cmd_stop(args):
+    name = args.name
+    require_watch(name)
+    pid = producer_pid(name)
+    if not pid:
+        print(f"{name} is not running")
+        return
+    # The producer runs the command in its own session, so kill the group: the
+    # command is the thing that actually holds the tail or the poll loop.
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    for _ in range(40):
+        if not producer_pid(name):
+            break
+        time.sleep(0.05)
+    print(f"stopped {name}" if not producer_pid(name) else f"{name} did not stop")
+
+
+def cmd_drop(args):
+    name = args.name
+    d = require_watch(name)
+    if producer_pid(name):
+        die(f"{name} is still running; `watcher stop {name}` first")
+    for p in sorted(d.iterdir()):
+        p.unlink()
+    d.rmdir()
+    print(f"dropped {name} and its event history")
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="watcher",
+        description="long-lived event watches: a detached producer, a one-shot wait")
+    sub = p.add_subparsers(dest="command")
+
+    s = sub.add_parser("start", help="start a watch (its stdout lines are events)")
+    s.add_argument("name")
+    s.add_argument("--cwd", default="", help="directory to run in (default: here)")
+    s.add_argument("command", nargs=argparse.REMAINDER,
+                   help="-- then the command whose stdout lines are events")
+    s.set_defaults(func=cmd_start)
+
+    s = sub.add_parser("wait", help="block until events arrive, print them, exit")
+    s.add_argument("name")
+    s.add_argument("--timeout", type=float, default=0,
+                   help="give up after N seconds (exit 2); default: wait forever")
+    s.add_argument("--meta", action="store_true",
+                   help="include start/stop notices as events")
+    s.set_defaults(func=cmd_wait)
+
+    s = sub.add_parser("status", help="what is running, and what is queued")
+    s.add_argument("name", nargs="?")
+    s.set_defaults(func=cmd_status)
+
+    s = sub.add_parser("log", help="replay a watch's events")
+    s.add_argument("name")
+    s.add_argument("--tail", type=int, default=20)
+    s.set_defaults(func=cmd_log)
+
+    s = sub.add_parser("stop", help="stop a watch, keeping its history")
+    s.add_argument("name")
+    s.set_defaults(func=cmd_stop)
+
+    s = sub.add_parser("drop", help="delete a stopped watch and its history")
+    s.add_argument("name")
+    s.set_defaults(func=cmd_drop)
+
+    s = sub.add_parser("_produce", help=argparse.SUPPRESS)
+    s.add_argument("name")
+    s.set_defaults(func=cmd_produce)
+
+    sub.add_parser("help", help="show this help").set_defaults(func=None)
+    return p
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    if not args.command or args.command == "help":
+        parser.print_help()
+        return
+    try:
+        args.func(args)
+    except BrokenPipeError:
+        os._exit(0)
+    except KeyboardInterrupt:
+        raise SystemExit(130)
+
+
+if __name__ == "__main__":
+    main()
