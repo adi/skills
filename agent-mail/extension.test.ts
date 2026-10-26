@@ -12,12 +12,14 @@ test("Maildir listener: real CLI delivery, idle batching, persistence, conflicts
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-mail-test-"));
   process.env.AGENT_MAIL_ROOT = root;
   const cli = path.join(import.meta.dirname, "agent-mail");
+  process.env.AGENT_MAIL_CLI = cli;
   const run = (...args: string[]) => execFileSync("python3", [cli, ...args], { env: process.env });
   run("register", "pi@test");
   run("register", "other@test");
   function harness(branch: any[] = []) {
     const hooks = new Map<string, any>();
     const commands = new Map<string, any>();
+    let tool: any;
     const messages: any[] = [];
     const notices: any[] = [];
     let idle = true;
@@ -31,6 +33,11 @@ test("Maildir listener: real CLI delivery, idle batching, persistence, conflicts
     extension({
       on: (name: string, fn: any) => hooks.set(name, fn),
       registerCommand: (name: string, command: any) => commands.set(name, command),
+      registerTool: (registered: any) => { tool = registered; },
+      exec: async (_cli: string, args: string[]) => {
+        try { return { code: 0, stdout: run(...args).toString(), stderr: "" }; }
+        catch (error: any) { return { code: 1, stdout: error.stdout?.toString(), stderr: error.stderr?.toString() }; }
+      },
       appendEntry: (customType: string, data: any) => branch.push({ type: "custom", customType, data }),
       sendMessage: (message: any, options: any) => { messages.push({ message, options }); idle = false; },
     } as any);
@@ -38,6 +45,7 @@ test("Maildir listener: real CLI delivery, idle batching, persistence, conflicts
       messages, notices, branch,
       event: (name: string) => hooks.get(name)?.({}, ctx),
       mail: (arg: string) => commands.get("mail").handler(arg, ctx),
+      tool: (params: any) => tool.execute("test", params, new AbortController().signal, undefined, ctx),
       idle: (value: boolean) => { idle = value; },
     };
   }
@@ -45,7 +53,9 @@ test("Maildir listener: real CLI delivery, idle batching, persistence, conflicts
   const b = harness();
   try {
     await a.event("session_start");
-    await a.mail("pi@test");
+    await assert.rejects(a.tool({ action: "read" }), /No session identity/);
+    await assert.rejects(a.tool({ action: "join", address: "pi" }), /full name@domain/);
+    await a.tool({ action: "attach", address: "pi@test" });
     await pause();
     assert.equal(a.messages.length, 0, "empty inbox doesn't trigger a turn");
     a.idle(false);
@@ -85,11 +95,21 @@ test("Maildir listener: real CLI delivery, idle batching, persistence, conflicts
     await resumed.mail("off");
     await resumed.event("session_shutdown");
     assert.equal(resumed.branch.at(-1).data.address, null);
+    await b.tool({ action: "peek" });
+    const sent = await b.tool({ action: "send", to: "pi", subject: "literal shell", body: "$(touch /tmp/never-run-this) ; 'quoted'" });
+    assert.match(sent.content[0].text, /sent to pi@test/);
+    assert.equal(fs.existsSync("/tmp/never-run-this"), false);
+    await b.tool({ action: "off" });
+    await assert.rejects(b.tool({ action: "send", to: "pi", subject: "no", body: "no" }), /No session identity/);
+    await b.tool({ action: "join", address: "new@test" });
+    assert.equal(b.branch.at(-1).data.address, "new@test");
+    assert.match((await b.tool({ action: "agents", domain: "test" })).content[0].text, /new/);
     await b.event("session_shutdown");
   } finally {
     await a.event("session_shutdown");
     await b.event("session_shutdown");
     delete process.env.AGENT_MAIL_ROOT;
+    delete process.env.AGENT_MAIL_CLI;
     fs.rmSync(root, { recursive: true, force: true });
   }
 });

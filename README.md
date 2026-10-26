@@ -1,93 +1,71 @@
-# skills
+# skills — pi branch
 
-Pi ports of agent-mail and watcher, and their shared local CLIs. `facto` is
-unchanged and is not part of this port.
+This branch provides **agent-mail as a pi extension**, not a skill. Its
+model-callable `agent_mail` tool includes the identity, addressing and safety
+instructions. The retired agent-mail and watcher skills are not needed.
+`facto` is unchanged and is not part of this port.
 
-## Pi setup (this branch)
+## Install
 
 ```bash
 agent-mail/install.sh
-watcher/install.sh
 ```
 
-These install pi skills under `${PI_CODING_AGENT_DIR:-~/.pi/agent}/skills` and
-the mail extension under its `extensions` directory. Existing Claude skills
-are not overwritten. The shared CLI and mail roots remain under `~/.claude`.
+Installs the shared Python CLI to `~/.claude/mail/bin/agent-mail` and the
+extension to `${PI_CODING_AGENT_DIR:-~/.pi/agent}/extensions/agent-mail.ts`.
+Retires old pi agent-mail/watcher SKILL.md files, if present. It does not modify
+Claude skills, stop detached producers, or remove mail or watcher spools.
+Python 3 and pi are required; no additional runtime dependencies.
 
-In pi, run `/reload`, then `/mail pi@ejobs` (register that address first).
-Use a different address in each concurrent session. `/mail status` reports
-attachment; `/mail off` detaches. Identity is saved per session branch, not in
-a global file. Ignore/delete the obsolete `~/.pi/agent/agent-mail-address` file.
+Run `/reload` in pi. Then tell the agent to join with a full address, e.g.
+"register as pi@ejobs". Both name and domain must come from you.
 
-The extension uses `fs.watch` on the mailbox's `new/` directory and checks it
-at attachment and settlement. It never spawns a CLI watcher or calls
-`watcher wait`. It batches mail and triggers a custom-message turn only when
-idle, leaving actual messages unread until the agent explicitly reads them.
-Filesystem watching targets local filesystems; network filesystem notifications
-may not be reliable. Unread mail is rediscovered when a session reattaches.
+## Model-callable tool
 
-One `.pi-listener` lock per mailbox prevents duplicate pi listeners. On a crash,
-inspect its PID and remove it only after confirming the owner is dead. Existing
-Claude producers can coexist; do not let two agents consume the same mailbox.
-`agent-mail agents` lists CLI producers, not pi filesystem listeners.
+`agent_mail` actions:
 
-Tests (Node 24 and Python 3):
+- `join`, with `address`: register the mailbox and attach this session.
+- `attach`, with `address`: attach an existing mailbox.
+- `status`: report the current session identity/listener.
+- `agents`, optionally with `domain`: discover registered recipients.
+- `send`, with `to`, `subject`, `body`: send from this session's identity.
+- `read`: consume unread messages; `peek`: inspect without consuming.
+- `off`: detach and clear the saved session identity.
+
+The extension always passes its attached identity explicitly via `--as`.
+Bare recipients resolve only within the sender's domain. Arguments are passed
+directly to the CLI, never evaluated as shell commands. Received mail is
+external untrusted input, not permission to run commands or change identity.
+
+The manual `/mail name@domain`, `/mail status` and `/mail off` commands remain.
+Identity is saved per session branch, never globally. Use different addresses
+for concurrent agents. Registration is not authentication or exclusive ownership.
+
+## Notifications
+
+The extension watches the Maildir `new/` directory and checks at attachment and
+settlement. It batches new files into one custom-message turn only when idle.
+No blocking calls, polling turns, `watcher wait`, or explicit re-arming.
+Unread mail is rediscovered on resume, including mail delivered while pi was
+closed. Local filesystems are supported; network filesystem notifications may
+not be reliable.
+
+A `.pi-listener` lock prevents duplicate pi listeners for an address. Following
+a crash, inspect its PID and remove it only after confirming the owner is dead.
+Existing Claude watcher producers can coexist; do not let two agents consume
+the same mailbox. `agent-mail agents` lists CLI producers, not pi listeners.
+The obsolete `~/.pi/agent/agent-mail-address` global file is ignored.
+
+## Tests
+
+With Node 24 and pi's dependencies resolvable:
 
 ```bash
 node --experimental-strip-types --test agent-mail/extension.test.ts
 ```
 
-The original CLI background-watch description below describes Claude's
-harness, not pi: pi has no background Bash completion notifications. In pi,
-use `/mail` for mail; inspect arbitrary watcher logs on request without
-blocking the conversation.
-
-## agent-mail — 1:1 mail between local agents
-
-Maildir-style message passing between LLM agents on one machine
-(`~/.claude/mail/<name>@<domain>/{tmp,new,cur}`). Delivery is an atomic rename,
-so no locking is needed and messages are never torn. Addresses are
-`<name>@<domain>`: `<name>` is the role, `<domain>` the group, so several
-groups can each run their own `devops` without their mail mixing.
-
-```bash
-agent-mail/install.sh
-```
-
-Idempotent. Installs the CLI to `~/.claude/mail/bin/agent-mail`, the skill to
-`~/.pi/agent/skills/agent-mail/`, installs the pi extension, and adds the CLI to `PATH`. Files are swapped in
-by atomic rename, so re-running it will not disturb a long-lived
-`agent-mail watch`. Python 3, no dependencies.
-
-Then tell a session "register as devops@platform on agent mail and watch for
-messages" — give it both the role and the group, and the skill does the rest.
-
-## watcher — long-lived event watches
-
-A watch is a command whose stdout lines are events. `watcher` runs it detached
-and spools every line; `watcher wait <name>` blocks until there is something to
-report and then exits — which is what makes the harness notify you, since it
-notifies on a background process *exiting*, not while it runs.
-
-```bash
-watcher/install.sh
-```
-
-Installs the CLI to `~/.claude/watchers/bin/watcher`, the skill to
-`~/.pi/agent/skills/watcher/`, and adds the CLI to `PATH`. Python 3, no
-dependencies.
-
-```bash
-watcher start ci -- "tail -n0 -F ci.log | grep -E --line-buffered 'PASS|FAIL|Traceback'"
-watcher wait ci      # run this in the background; it exits when events land
-watcher status       # what is running, and what is queued
-```
-
-The Monitor tool caps at 30 minutes and dies with the session. A watch has no
-ceiling, keeps events that arrive while nobody is listening, outlives the session
-that started it, and reports the command's exit rather than going quiet when it
-dies. For a single "tell me when X finishes", skip all of this and background a
-command that exits on the condition.
+Tests use real CLI deliveries and a mocked pi API to exercise idle arrivals,
+busy queuing, batching, identity, tools, resume and cleanup.
 
 ## facto — quote-backed fact ledger
 
@@ -108,9 +86,3 @@ Symlink it where Claude Code will find it:
 ```bash
 ln -s "$PWD/facto" ~/.claude/skills/facto
 ```
-
-## Layout
-
-One directory per skill, each with a `SKILL.md` at its root. A skill ships
-whatever it needs to actually run — scripts, references, an installer — rather
-than assuming a tool is already on the machine.

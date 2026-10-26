@@ -1,5 +1,5 @@
 #!/bin/bash
-# Installer for agent-mail: shared CLI, pi skill and idle-only extension.
+# Installer for agent-mail: shared CLI and tool-providing pi extension.
 # Safe to re-run; each step is idempotent.
 #
 # This repo is agent-mail's home. Run this from a clone:
@@ -24,11 +24,16 @@ _swap_in() {   # _swap_in <mode> <src> <dst>
   mv -f "$3.new.$$" "$3"
 }
 
-mkdir -p "$HOME/.claude/mail/bin" "$AGENT_DIR/skills/agent-mail" "$AGENT_DIR/extensions"
+mkdir -p "$HOME/.claude/mail/bin" "$AGENT_DIR/extensions"
 _swap_in 0755 "$HERE/agent-mail" "$HOME/.claude/mail/bin/agent-mail"
-_swap_in 0644 "$HERE/SKILL.md" "$AGENT_DIR/skills/agent-mail/SKILL.md"
 _swap_in 0644 "$HERE/extension.ts" "$AGENT_DIR/extensions/agent-mail.ts"
-echo "installed shared CLI, pi skill and extension; run /reload then /mail name@domain"
+# Retire the old pi instructions without deleting any supporting user files.
+for skill in agent-mail watcher; do
+  if [ -f "$AGENT_DIR/skills/$skill/SKILL.md" ]; then
+    mv "$AGENT_DIR/skills/$skill/SKILL.md" "$AGENT_DIR/skills/$skill/SKILL.md.retired"
+  fi
+done
+echo "installed CLI and pi extension; run /reload. The agent_mail tool can join and attach."
 
 if grep -qF '.claude/mail/bin' "$BASHRC" 2>/dev/null; then
   echo "PATH entry already in $BASHRC"
