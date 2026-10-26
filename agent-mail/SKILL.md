@@ -81,31 +81,26 @@ Do this first, once per session.
    watcher start <name>@<domain> -- "~/.claude/mail/bin/agent-mail watch --as <name>@<domain>"
    ```
 
-   Then block on it with the **Bash tool, `run_in_background: true`**:
+   Then wait on it with **`watcher wait <name>@<domain>`, run as a pi Bash tool
+   call with a long timeout (e.g. `timeout: 900`).** The call blocks until mail
+   arrives, then returns with the sender and subject in hand — that blocking
+   call returning is what notifies you. Handle the mail, then issue another
+   long `watcher wait` call.
 
-   ```bash
-   watcher wait <name>@<domain>
-   ```
-
-   That exits the moment mail lands, which is what notifies you, with the
-   sender and subject in hand. Handle the mail, then run `watcher wait` again.
+   If the tool call times out first, nothing is lost: events queue in the
+   spool, and the next `wait` returns whatever is pending immediately. Do not
+   treat the timeout as a failure — just issue another `wait`.
 
    `agent-mail watch` prints one line per newly delivered message and nothing at
    all otherwise, so an idle mailbox produces nothing whatsoever. It looks every
    5 seconds, so a message can take that long to reach you — that is the poll
    interval, not a stall. `--interval 2` tightens it if a few seconds matter.
 
-   **Not the Monitor tool.** A Monitor stops after 30 minutes and takes the watch
-   with it, silently — a mailbox that has stopped being watched looks exactly
-   like a quiet one. A `watcher` producer runs detached with no ceiling, survives
-   the session, and queues anything that arrives while nothing is waiting, so
-   mail that lands between notifications is delivered by the next `wait` rather
-   than missed.
-
-   **Do not use a cron, `/loop`, or any other timer either.** A timer polls: it
-   spends a turn every interval whether or not mail exists, and a turn cannot be
-   silent — the best it can manage is a placeholder character every minute,
-   forever. Mail arrival is an event, so watch for the event.
+   **Do not use a cron, a loop, or any other timer.** A timer polls: it spends a
+   turn every interval whether or not mail exists. Mail arrival is an event, so
+   watch for the event: one blocking `wait` per message, re-armed after each
+   one. If you find yourself issuing repeated short `check` calls, stop and
+   re-arm the watch instead.
 
    Two layers refuse a second watcher on one address: `agent-mail watch` claims
    the address, and `watcher wait` allows one consumer. Two would announce every
@@ -117,7 +112,8 @@ Do this first, once per session.
 
 ## When a notification arrives
 
-A notification reading `new mail from <sender>: <subject>` means mail is waiting.
+A `watcher wait` returning with lines reading `new mail from <sender>:
+<subject>` means mail is waiting.
 
 ```bash
 ~/.claude/mail/bin/agent-mail read --as <name>@<domain>
