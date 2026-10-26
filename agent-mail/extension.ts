@@ -78,7 +78,9 @@ export default function agentMail(pi: ExtensionAPI) {
     }
     if (addr === address && watcher) return;
     const dir = path.join(root, addr, "new");
-    if (!fs.statSync(dir).isDirectory()) throw new Error("Mailbox does not exist; register it first.");
+    if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) {
+      throw new Error(`Mailbox ${addr} does not exist. Use agent_mail action join, or /mail ${addr}, to register and attach.`);
+    }
     // Separate from agent-mail's .watch lock: old detached producers can coexist.
     const nextLock = path.join(root, addr, ".pi-listener");
     try {
@@ -168,7 +170,7 @@ export default function agentMail(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("mail", {
-    description: "Listen for mail when idle: /mail name@domain | off | status",
+    description: "Register and listen when idle: /mail name@domain | off | status",
     handler: async (args, context) => {
       ctx = context;
       const arg = args.trim();
@@ -183,6 +185,12 @@ export default function agentMail(pi: ExtensionAPI) {
         return;
       }
       try {
+        if (!/^[A-Za-z0-9_-][A-Za-z0-9._-]*@[A-Za-z0-9_-][A-Za-z0-9._-]*$/.test(arg)) {
+          throw new Error("Use a full name@domain address supplied by the user.");
+        }
+        // Registration is idempotent and preserves an existing mailbox.
+        const output = await pi.exec(cli, ["register", arg]);
+        if (output.code !== 0) throw new Error(output.stderr || output.stdout || "Mailbox registration failed.");
         attach(arg);
         pi.appendEntry("agent-mail-address", { address: arg });
         notify(`listening as ${arg}; no blocking waits`);

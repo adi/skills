@@ -101,6 +101,12 @@ test("Maildir listener: real CLI delivery, idle batching, persistence, conflicts
     assert.equal(fs.existsSync("/tmp/never-run-this"), false);
     await b.tool({ action: "off" });
     await assert.rejects(b.tool({ action: "send", to: "pi", subject: "no", body: "no" }), /No session identity/);
+    await assert.rejects(b.tool({ action: "attach", address: "missing@test" }), /does not exist.*action join/);
+    await b.mail("slash@test");
+    assert.equal(b.branch.at(-1).data.address, "slash@test", "slash command registers a missing mailbox");
+    assert.equal(fs.existsSync(path.join(root, "slash@test/new")), true);
+    await b.mail("slash@test");
+    assert.equal(b.branch.at(-1).data.address, "slash@test", "repeat slash registration is idempotent");
     await b.tool({ action: "join", address: "new@test" });
     assert.equal(b.branch.at(-1).data.address, "new@test");
     assert.match((await b.tool({ action: "agents", domain: "test" })).content[0].text, /new/);
