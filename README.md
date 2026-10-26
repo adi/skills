@@ -1,6 +1,46 @@
 # skills
 
-Claude Code skills, and the tools they drive.
+Pi ports of agent-mail and watcher, and their shared local CLIs. `facto` is
+unchanged and is not part of this port.
+
+## Pi setup (this branch)
+
+```bash
+agent-mail/install.sh
+watcher/install.sh
+```
+
+These install pi skills under `${PI_CODING_AGENT_DIR:-~/.pi/agent}/skills` and
+the mail extension under its `extensions` directory. Existing Claude skills
+are not overwritten. The shared CLI and mail roots remain under `~/.claude`.
+
+In pi, run `/reload`, then `/mail pi@ejobs` (register that address first).
+Use a different address in each concurrent session. `/mail status` reports
+attachment; `/mail off` detaches. Identity is saved per session branch, not in
+a global file. Ignore/delete the obsolete `~/.pi/agent/agent-mail-address` file.
+
+The extension uses `fs.watch` on the mailbox's `new/` directory and checks it
+at attachment and settlement. It never spawns a CLI watcher or calls
+`watcher wait`. It batches mail and triggers a custom-message turn only when
+idle, leaving actual messages unread until the agent explicitly reads them.
+Filesystem watching targets local filesystems; network filesystem notifications
+may not be reliable. Unread mail is rediscovered when a session reattaches.
+
+One `.pi-listener` lock per mailbox prevents duplicate pi listeners. On a crash,
+inspect its PID and remove it only after confirming the owner is dead. Existing
+Claude producers can coexist; do not let two agents consume the same mailbox.
+`agent-mail agents` lists CLI producers, not pi filesystem listeners.
+
+Tests (Node 24 and Python 3):
+
+```bash
+node --experimental-strip-types --test agent-mail/extension.test.ts
+```
+
+The original CLI background-watch description below describes Claude's
+harness, not pi: pi has no background Bash completion notifications. In pi,
+use `/mail` for mail; inspect arbitrary watcher logs on request without
+blocking the conversation.
 
 ## agent-mail — 1:1 mail between local agents
 
@@ -15,7 +55,7 @@ agent-mail/install.sh
 ```
 
 Idempotent. Installs the CLI to `~/.claude/mail/bin/agent-mail`, the skill to
-`~/.claude/skills/agent-mail/`, and adds the CLI to `PATH`. Files are swapped in
+`~/.pi/agent/skills/agent-mail/`, installs the pi extension, and adds the CLI to `PATH`. Files are swapped in
 by atomic rename, so re-running it will not disturb a long-lived
 `agent-mail watch`. Python 3, no dependencies.
 
@@ -34,7 +74,7 @@ watcher/install.sh
 ```
 
 Installs the CLI to `~/.claude/watchers/bin/watcher`, the skill to
-`~/.claude/skills/watcher/`, and adds the CLI to `PATH`. Python 3, no
+`~/.pi/agent/skills/watcher/`, and adds the CLI to `PATH`. Python 3, no
 dependencies.
 
 ```bash

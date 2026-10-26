@@ -37,6 +37,19 @@ The CLI is Python 3, no dependencies, and is bundled in this skill's directory �
 run it from there if it is not on `PATH`. Spools live under
 `~/.claude/watchers/<name>/` (`$WATCHER_ROOT` moves them).
 
+## Pi limitation: do not block the conversation
+
+This CLI preserves background producer output, but does not itself wake pi.
+For agent mail, use the agent-mail extension and `/mail name@domain`; never
+use `watcher wait` as the mail notification path.
+
+For arbitrary watches, start the detached producer, return control to the user,
+and inspect `watcher status` or `watcher log` on request. Only run a blocking
+`wait` if the user explicitly asks to wait synchronously. Do not automatically
+re-arm it, or claim that a detached producer alone provides automatic pi turns.
+
+The following blocking workflow is opt-in, not the default in pi.
+
 ## The loop
 
 ### 1. Start the watch, once
@@ -64,13 +77,12 @@ advances only over what was printed.
 
 If the tool call times out first, nothing is lost: events queue in the spool,
 and the next `wait` returns whatever is pending immediately. Do not treat the
-timeout as a failure — just issue another `wait`. Keep issuing them until you
-have what you were watching for.
+timeout as a failure. Return control to the user instead of repeatedly waiting.
 
 ### 3. Handle what arrived, then arm it again
 
-Re-arm immediately. Events that land in the gap are not lost — they are waiting
-for the next `wait` — but the gap is time you are not being told about.
+Return control after handling the events. Events that land later remain in the
+spool; do not re-arm a blocking call unless explicitly asked.
 
 When you are done, `watcher stop deploy`. A stopped watch keeps its history;
 `watcher drop deploy` removes it.

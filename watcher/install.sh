@@ -1,5 +1,5 @@
 #!/bin/bash
-# Installer for watcher: the CLI and its Claude Code skill.
+# Installer for watcher: shared CLI and pi skill.
 # Safe to re-run; each step is idempotent.
 #
 # This repo is watcher's home. Run this from a clone:
@@ -11,6 +11,7 @@ set -eu
 HERE=$(cd "$(dirname "$0")" && pwd)
 BIN_DIR="$HOME/.claude/watchers/bin"
 BASHRC=$HOME/.bashrc
+AGENT_DIR=${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}
 
 echo "== watcher =="
 command -v python3 >/dev/null || echo "warning: python3 not found; the CLI needs it" >&2
@@ -23,11 +24,11 @@ _swap_in() {   # _swap_in <mode> <src> <dst>
   mv -f "$3.new.$$" "$3"
 }
 
-mkdir -p "$BIN_DIR" "$HOME/.claude/skills/watcher"
+mkdir -p "$BIN_DIR" "$AGENT_DIR/skills/watcher"
 _swap_in 0755 "$HERE/watcher" "$BIN_DIR/watcher"
-_swap_in 0644 "$HERE/SKILL.md" "$HOME/.claude/skills/watcher/SKILL.md"
-echo "installed CLI to ~/.claude/watchers/bin/watcher"
-echo "installed skill to ~/.claude/skills/watcher/SKILL.md"
+_swap_in 0755 "$HERE/watcher" "$AGENT_DIR/skills/watcher/watcher"
+_swap_in 0644 "$HERE/SKILL.md" "$AGENT_DIR/skills/watcher/SKILL.md"
+echo "installed shared CLI and pi skill; run /reload"
 
 if grep -qF '.claude/watchers/bin' "$BASHRC" 2>/dev/null; then
   echo "PATH entry already in $BASHRC"
