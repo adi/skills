@@ -1,6 +1,7 @@
 # skills
 
-Claude Code skills, and the tools they drive.
+Agent skills and the tools they drive. Agent-mail supports Claude Code, Pi,
+and Codex through their respective adapters.
 
 ## agent-mail — 1:1 mail between local agents
 
@@ -21,6 +22,21 @@ by atomic rename, so re-running it will not disturb a long-lived
 
 Then tell a session "register as devops@platform on agent mail and watch for
 messages" — give it both the role and the group, and the skill does the rest.
+
+For Codex, install the mail MCP server, skill, and CLI adapter from this repo:
+
+```bash
+agent-mail/install-codex.sh
+```
+
+This exposes `agent_mail` through the `agent-mail` MCP server and installs
+`codex-agent-mail`. It uses the existing Maildirs and sends notifications via
+Codex's session queue. See [Codex integration](agent-mail/references/codex.md).
+Tmux team management is maintained separately in `~/work/team`.
+
+```bash
+node --test agent-mail/tests/codex.test.mjs
+```
 
 ## watcher — long-lived event watches
 
