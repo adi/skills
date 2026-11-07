@@ -1,7 +1,7 @@
 # Claude Code channel for agent-mail
 
 `claude-channel.mjs` pushes a notice into a running Claude Code session when mail
-arrives, so the session does not have to re-arm `watcher wait` after every message.
+arrives, so the session needs no watch process or polling of its own.
 It is the Claude counterpart of the Codex listener in `codex.mjs`, built on Claude
 Code [channels](https://code.claude.com/docs/en/channels-reference) (research preview).
 
@@ -63,9 +63,8 @@ arrived while it was down.
 The server takes `<mailbox>/.claude-channel` (pid and token). A second session for the
 same address gets a server that exits at once with "already has a Claude channel" while the first is
 alive. A lock left by a dead process is taken over. The lock goes when the session
-ends. Other harnesses' locks (`.codex-listener`, `.pi-listener`, the watcher's) are
-never read or removed, so a `watcher` watch on the same address keeps working as a
-fallback, at the cost of a second notice per message.
+ends. Other harnesses' locks (`.codex-listener`, `.pi-listener`, `agent-mail watch`'s) are
+never read or removed.
 
 ## Tests
 
